@@ -3,11 +3,15 @@
 대한민국 법원 경매정보 사이트 (courtauction.go.kr) 크롤링
 """
 
+import os
 import re
 import time
 import logging
+import base64
+import tempfile
 from typing import Optional
 from datetime import datetime
+from pathlib import Path
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -296,3 +300,202 @@ def crawl_appraisal(case_no: str, court: Optional[str] = None) -> Optional[str]:
         return None
     finally:
         driver.quit()
+
+
+# ─── PDF 문서 자동 크롤링 ───
+
+# 문서 저장 디렉토리
+DOCS_DIR = Path(tempfile.gettempdir()) / "kirifin_docs"
+DOCS_DIR.mkdir(exist_ok=True)
+
+DOC_TYPES = {
+    "매각물건명세서": "sale_spec",
+    "현황조사서": "status_report",
+    "감정평가서": "appraisal",
+}
+
+
+def crawl_documents(case_no: str, court: Optional[str] = None) -> list[dict]:
+    """사건의 모든 문서(매각물건명세서/현황조사서/감정평가서) PDF를 자동 크롤링.
+
+    법원경매 사이트에서 사건번호로 상세 페이지 접속 → 문서 탭 → PDF 다운로드.
+    다운로드된 PDF는 base64로 인코딩하여 반환합니다.
+
+    Args:
+        case_no: 사건번호 (예: "2024타경108834")
+        court: 법원명 (선택)
+
+    Returns:
+        [{"type": "매각물건명세서", "filename": "...", "base64": "...", "url": "..."}, ...]
+    """
+    driver = create_driver()
+    documents = []
+
+    try:
+        logger.info(f"문서 크롤링 시작: {case_no}")
+
+        # 사건번호에서 연도와 번호 추출
+        match = re.match(r"(\d{4})타경(\d+)", case_no)
+        if not match:
+            logger.error(f"잘못된 사건번호 형식: {case_no}")
+            return []
+
+        year, num = match.groups()
+
+        # 법원경매 사이트 상세 페이지 접속
+        detail_url = (
+            f"{COURT_AUCTION_URL}/RetrieveRealEstCarHvyMacDetailInfo.laf"
+            f"?saession=00000000&saession2=00000000"
+        )
+        driver.get(detail_url)
+        time.sleep(CRAWL_DELAY * 2)
+
+        # 사건번호 입력하여 검색 시도
+        try:
+            # 사건번호 직접 입력
+            case_input = driver.find_elements(By.CSS_SELECTOR,
+                "input[name*='saNo'], input[name*='caseNo'], input[id*='saNo']")
+            if case_input:
+                case_input[0].clear()
+                case_input[0].send_keys(case_no)
+                time.sleep(CRAWL_DELAY)
+        except Exception as e:
+            logger.warning(f"사건번호 입력 실패: {e}")
+
+        # 페이지 소스 파싱
+        time.sleep(CRAWL_DELAY * 2)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
+        # PDF 링크 탐색 패턴들
+        pdf_selectors = [
+            # 직접적인 PDF 링크
+            "a[href*='.pdf']",
+            "a[onclick*='openPdf']",
+            "a[onclick*='viewPdf']",
+            "a[onclick*='PDF']",
+            "a[onclick*='pdf']",
+            # 문건 관련 링크
+            "a[onclick*='매각물건']",
+            "a[onclick*='현황조사']",
+            "a[onclick*='감정평가']",
+            "a[onclick*='MungunView']",
+            "a[onclick*='RetrieveMungun']",
+            # 일반적인 문서 링크
+            "a[class*='doc'], a[class*='pdf'], a[class*='file']",
+        ]
+
+        found_links = []
+        for selector in pdf_selectors:
+            links = soup.select(selector)
+            for link in links:
+                text = link.get_text(strip=True)
+                href = link.get("href", "")
+                onclick = link.get("onclick", "")
+                found_links.append({
+                    "text": text,
+                    "href": href,
+                    "onclick": onclick,
+                })
+
+        logger.info(f"발견된 문서 링크: {len(found_links)}개")
+
+        # 각 문서 유형별로 PDF URL 추출
+        for doc_name, doc_key in DOC_TYPES.items():
+            for link_info in found_links:
+                combined = f"{link_info['text']} {link_info['href']} {link_info['onclick']}"
+                if doc_name in combined or doc_key in combined.lower():
+                    pdf_url = None
+
+                    # href에서 PDF URL 추출
+                    if link_info["href"] and ".pdf" in link_info["href"].lower():
+                        pdf_url = link_info["href"]
+                        if not pdf_url.startswith("http"):
+                            pdf_url = COURT_AUCTION_URL + pdf_url
+
+                    # onclick에서 URL 추출
+                    if not pdf_url and link_info["onclick"]:
+                        url_match = re.search(
+                            r"['\"]([^'\"]*(?:\.pdf|Mungun|mungun|PDF)[^'\"]*)['\"]",
+                            link_info["onclick"]
+                        )
+                        if url_match:
+                            pdf_url = url_match.group(1)
+                            if not pdf_url.startswith("http"):
+                                pdf_url = COURT_AUCTION_URL + "/" + pdf_url.lstrip("/")
+
+                    if pdf_url:
+                        doc_data = _download_pdf(driver, pdf_url, case_no, doc_key)
+                        if doc_data:
+                            documents.append({
+                                "type": doc_name,
+                                "key": doc_key,
+                                "filename": f"{case_no}_{doc_key}.pdf",
+                                "url": pdf_url,
+                                "size": len(doc_data),
+                                "base64": base64.b64encode(doc_data).decode("utf-8"),
+                            })
+                            logger.info(f"  ✅ {doc_name} 다운로드 완료 ({len(doc_data)} bytes)")
+                        break  # 해당 문서 유형은 하나만
+
+        # 직접 JavaScript로 문서 URL 탐색 시도
+        if not documents:
+            logger.info("직접 링크 탐색 시도...")
+            try:
+                js_urls = driver.execute_script("""
+                    var urls = [];
+                    var allLinks = document.querySelectorAll('a');
+                    allLinks.forEach(function(a) {
+                        var href = a.href || '';
+                        var onclick = a.getAttribute('onclick') || '';
+                        var text = a.textContent || '';
+                        if (href.includes('pdf') || href.includes('PDF') ||
+                            onclick.includes('pdf') || onclick.includes('PDF') ||
+                            onclick.includes('Mungun') ||
+                            text.includes('매각') || text.includes('현황') || text.includes('감정')) {
+                            urls.push({text: text.trim(), href: href, onclick: onclick});
+                        }
+                    });
+                    return urls;
+                """)
+                logger.info(f"JS 탐색 결과: {len(js_urls or [])}개 링크")
+                for js_link in (js_urls or []):
+                    logger.info(f"  - {js_link.get('text', '')}: {js_link.get('href', '')[:80]}")
+            except Exception as e:
+                logger.warning(f"JS 탐색 실패: {e}")
+
+        logger.info(f"문서 크롤링 완료: {len(documents)}개 다운로드")
+
+    except Exception as e:
+        logger.error(f"문서 크롤링 오류: {e}")
+    finally:
+        driver.quit()
+
+    return documents
+
+
+def _download_pdf(driver, url: str, case_no: str, doc_key: str) -> Optional[bytes]:
+    """PDF 파일 다운로드"""
+    try:
+        import httpx
+
+        # Selenium 세션 쿠키를 httpx로 전달
+        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+
+        with httpx.Client(timeout=30, follow_redirects=True) as client:
+            resp = client.get(url, cookies=cookies, headers={
+                "User-Agent": driver.execute_script("return navigator.userAgent"),
+                "Referer": COURT_AUCTION_URL,
+            })
+
+            if resp.status_code == 200 and len(resp.content) > 100:
+                # 로컬 저장
+                filepath = DOCS_DIR / f"{case_no}_{doc_key}.pdf"
+                filepath.write_bytes(resp.content)
+                return resp.content
+
+        logger.warning(f"PDF 다운로드 실패: {url} (status={resp.status_code})")
+        return None
+
+    except Exception as e:
+        logger.warning(f"PDF 다운로드 오류: {url} — {e}")
+        return None
