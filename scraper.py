@@ -34,15 +34,24 @@ logger = logging.getLogger(__name__)
 
 def create_driver() -> webdriver.Chrome:
     """Chrome WebDriver 생성"""
+    import os
     options = Options()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # 헤드리스 모드 (서버용). 디버깅 시 주석 처리
-    # options.add_argument("--headless=new")
+    options.add_argument("--headless=new")
 
-    service = Service(ChromeDriverManager().install())
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if chrome_bin:
+        options.binary_location = chrome_bin
+
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if chromedriver_path:
+        service = Service(chromedriver_path)
+    else:
+        service = Service(ChromeDriverManager().install())
+
     driver = webdriver.Chrome(service=service, options=options)
     driver.implicitly_wait(SELENIUM_IMPLICIT_WAIT)
     driver.set_page_load_timeout(SELENIUM_TIMEOUT)
